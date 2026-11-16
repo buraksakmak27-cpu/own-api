@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.browser_profile/
+.sessions/
+logs/
+vault.db
+captured_traffic.json
+passport.json
+.env
