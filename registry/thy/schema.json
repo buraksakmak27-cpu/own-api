@@ -1,0 +1,55 @@
+{
+  "name": "thy_search",
+  "description": "thy üzerinde uçuş arama. Sonuç alanları: name, airline, from, to, departure, arrival, price, currency",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "origin": {
+        "type": "string",
+        "description": "originDestinationInformationList.0.originAirportCode (örnek format: IST)"
+      },
+      "destination": {
+        "type": "string",
+        "description": "originDestinationInformationList.0.destinationAirportCode (örnek format: ESB)"
+      },
+      "departure_date": {
+        "type": "string",
+        "description": "originDestinationInformationList.0.departureDate (örnek format: 02-03-2027)"
+      },
+      "return_date": {
+        "type": "string",
+        "description": "originDestinationInformationList.1.departureDate (örnek format: 09-03-2027)"
+      }
+    },
+    "required": [
+      "origin",
+      "destination",
+      "departure_date",
+      "return_date"
+    ]
+  },
+  "endpoint": {
+    "url": "https://www.turkishairlines.com/api/v1/availability",
+    "method": "POST",
+    "query_param": null,
+    "drop_params": [],
+    "query_templates": {},
+    "parameters": {
+      "origin": "originDestinationInformationList.0.originAirportCode",
+      "destination": "originDestinationInformationList.0.destinationAirportCode",
+      "departure_date": "originDestinationInformationList.0.departureDate",
+      "return_date": "originDestinationInformationList.1.departureDate"
+    },
+    "items_path": "data.originDestinationInformationList.0.originDestinationOptionList",
+    "fields": {
+      "name": "segmentList.0.flightCode.flightNumber",
+      "airline": "segmentList.0.flightCode.airlineCode",
+      "from": "segmentList.0.departureAirportCode",
+      "to": "segmentList.0.arrivalAirportCode",
+      "departure": "segmentList.0.departureDateTime",
+      "arrival": "segmentList.0.arrivalDateTime",
+      "price": "startingPrice.amount",
+      "currency": "startingPrice.currencyCode"
+    }
+  }
+}

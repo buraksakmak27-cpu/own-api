@@ -1,0 +1,2 @@
+[console_scripts]
+own-api = own_api.cli:cli

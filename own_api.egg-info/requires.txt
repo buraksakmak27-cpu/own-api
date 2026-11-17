@@ -1,0 +1,10 @@
+click
+playwright
+anthropic
+openai
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+mcp
+cryptography

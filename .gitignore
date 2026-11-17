@@ -8,3 +8,4 @@ vault.db
 captured_traffic.json
 passport.json
 .env
+*.log

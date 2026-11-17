@@ -1,0 +1,5 @@
+Metadata-Version: 2.1
+Name: own-api
+Version: 0.1.0
+Summary: API'si olmayan sitelerden kendi Chrome'unuz üzerinden API üretir.
+Requires-Python: >=3.10

@@ -1,0 +1,26 @@
+{
+  "name": "trendyol_search",
+  "description": "trendyol üzerinde ürün arama. Sonuç alanları: name, price",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Arama kelimesi"
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  "endpoint": {
+    "url": "https://apigw.trendyol.com/discovery-sfint-browsing-service/api/search-feed/products?source=sr%253Ftag%253Dkategori_encoksatanlar%2526sst%253DBEST_SELLER%2526tag%253Dkategori_encoksatanlar%2526tag%253Dkategori_encoksatanlar%2526tag%253Dkategori_encoksatanlar&channelId=1",
+    "method": "GET",
+    "query_param": "q",
+    "items_path": "contents",
+    "fields": {
+      "name": "name",
+      "price": "sanitizedPrice.finalPrice.value"
+    }
+  }
+}

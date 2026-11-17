@@ -6,6 +6,8 @@ Sadece gerçek Chrome + kalıcı profil (~/.own-api/.browser_profile).
 
 from __future__ import annotations
 
+import asyncio
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +17,35 @@ from playwright.async_api import (
     Playwright,
     async_playwright,
 )
+
+
+def _silence_windows_closed_pipe() -> None:
+    """Windows'ta 'ValueError: I/O operation on closed pipe' gürültüsünü susturur.
+
+    asyncio.run() döngüyü kapattıktan sonra çöp toplayıcı Playwright alt sürecinin
+    pipe transport'larını __del__ ile kapatmaya çalışır; döngü kapalı olduğu için
+    zararsız bir ValueError fırlar. Sadece bu hatayı yutar.
+    """
+    if sys.platform != "win32":
+        return
+    from asyncio.proactor_events import _ProactorBasePipeTransport
+
+    original_del = _ProactorBasePipeTransport.__del__
+    if getattr(original_del, "_own_api_patched", False):
+        return
+
+    def __del__(self, _warn=None):  # type: ignore[no-untyped-def]
+        try:
+            original_del(self)
+        except ValueError as e:
+            if "closed pipe" not in str(e):
+                raise
+
+    __del__._own_api_patched = True  # type: ignore[attr-defined]
+    _ProactorBasePipeTransport.__del__ = __del__  # type: ignore[assignment]
+
+
+_silence_windows_closed_pipe()
 
 DEFAULT_PROFILE_DIR = Path.home() / ".own-api" / ".browser_profile"
 
@@ -106,6 +137,8 @@ class ChromeBridge:
                 await self._playwright.stop()
             finally:
                 self._playwright = None
+                # Windows: alt sürecin pipe'larının döngü kapanmadan temizlenmesine izin ver.
+                await asyncio.sleep(0.1)
 
     async def __aenter__(self) -> "ChromeBridge":
         await self.start()
