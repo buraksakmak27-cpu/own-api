@@ -46,6 +46,13 @@
     background: var(--surface-2); border-radius: 10px; padding: 12px 14px; outline: none;
   }
   .search select { min-width: 140px; cursor: pointer; }
+  .search .fields { flex: 1; display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; }
+  .search .fields > input { flex: 1 1 140px; min-width: 120px; }
+  .search .fields .field { flex: 1 1 150px; min-width: 130px; display: flex; flex-direction: column; gap: 4px; }
+  .search .fields .field input { width: 100%; }
+  .search .fields .field .cap { font-size: 11px; color: var(--muted); padding-left: 2px; }
+  .search .fields .field .cap .req { font-style: normal; color: var(--accent); }
+  .search .fields .field .cap .opt { font-style: normal; color: var(--muted); }
   .search input { flex: 1; font-size: 15px; }
   .search input:focus, .search select:focus { border-color: var(--accent); }
   .search button {
@@ -102,6 +109,60 @@
   .recent .q { font-weight: 600; font-size: 14px; }
   .recent .meta { color: var(--muted); font-size: 12px; margin-top: 2px; display: flex; justify-content: space-between; gap: 8px; }
   .recent .min { color: var(--ok); }
+
+  header .spacer { flex: 1; }
+  .ghost-btn {
+    font: inherit; color: var(--text); cursor: pointer; font-weight: 600; font-size: 13px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 9px 16px;
+    transition: border-color .15s, background .15s;
+  }
+  .ghost-btn:hover { border-color: var(--accent); background: var(--surface-2); }
+
+  .overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none;
+    align-items: center; justify-content: center; padding: 20px; z-index: 50;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    width: 100%; max-width: 560px; max-height: 85vh; overflow-y: auto;
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+  }
+  .modal h2 {
+    font-size: 16px; font-weight: 700; padding: 18px 20px; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .modal .close { background: none; border: none; color: var(--muted); font-size: 22px; cursor: pointer; line-height: 1; }
+  .modal .body { padding: 20px; }
+  .modal .hint { color: var(--muted); font-size: 13px; margin-bottom: 14px; }
+  .keylist { list-style: none; margin: 0 0 16px; }
+  .keylist li {
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding: 11px 12px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 8px;
+    background: var(--surface-2);
+  }
+  .keylist .kname { font-weight: 600; font-size: 13px; }
+  .keylist .kmeta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .keylist code { font-family: ui-monospace, "Cascadia Code", monospace; font-size: 12px; color: var(--accent); }
+  .modal .empty { color: var(--muted); font-size: 13px; padding: 10px 0; }
+  .newkey {
+    margin-top: 10px; padding: 14px; border: 1px dashed var(--accent); border-radius: 10px;
+    background: rgba(108,140,255,.08); display: none;
+  }
+  .newkey.show { display: block; }
+  .newkey .warn { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .newkey .row { display: flex; gap: 8px; align-items: center; }
+  .newkey input {
+    flex: 1; font: inherit; font-family: ui-monospace, monospace; font-size: 12px;
+    color: var(--text); background: var(--bg); border: 1px solid var(--border);
+    border-radius: 8px; padding: 9px 11px;
+  }
+  .primary-btn {
+    font: inherit; border: none; cursor: pointer; font-weight: 600; color: #fff;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2)); border-radius: 9px; padding: 9px 16px;
+  }
+  .primary-btn:hover { filter: brightness(1.1); }
+  .primary-btn:disabled { opacity: .6; cursor: wait; }
 </style>
 </head>
 <body>
@@ -112,11 +173,15 @@
       <h1>own-api Panel</h1>
       <p>Kendi Chrome'unuz üzerinden canlı fiyat araması · sonuçlar Vault'a kaydedilir</p>
     </div>
+    <div class="spacer"></div>
+    <button class="ghost-btn" id="keysBtn" type="button">🔑 API Keys</button>
   </header>
 
   <form class="search" id="searchForm">
     <select id="site" title="Site"><option value="trendyol">trendyol</option></select>
-    <input id="query" type="text" placeholder="Ne arıyorsunuz? (örn. saat)" autocomplete="off" autofocus>
+    <div class="fields" id="paramFields">
+      <input id="param_query" type="text" placeholder="Ne arıyorsunuz? (örn. saat)" autocomplete="off" autofocus>
+    </div>
     <button id="searchBtn" type="submit">Ara</button>
   </form>
   <div class="status" id="status"></div>
@@ -145,6 +210,26 @@
   </div>
 </div>
 
+<div class="overlay" id="keysOverlay">
+  <div class="modal">
+    <h2>API Anahtarları <button class="close" id="keysClose" type="button" aria-label="Kapat">×</button></h2>
+    <div class="body">
+      <p class="hint">Bu anahtarlar <code>/api/{site}/search</code> isteklerinde
+        <code>Authorization: Bearer &lt;key&gt;</code> başlığı olarak kullanılır.
+        Panel kendi varsayılan anahtarını otomatik oluşturur.</p>
+      <ul class="keylist" id="keylist"><li class="empty">Yükleniyor...</li></ul>
+      <button class="primary-btn" id="genKeyBtn" type="button">+ Yeni Anahtar Üret</button>
+      <div class="newkey" id="newkey">
+        <div class="warn">⚠️ Bu anahtar yalnızca şimdi gösterilir, saklamak için kopyalayın:</div>
+        <div class="row">
+          <input id="newkeyValue" type="text" readonly>
+          <button class="ghost-btn" id="copyKeyBtn" type="button">Kopyala</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const fmtPrice = new Intl.NumberFormat("tr-TR", { style: "currency", currency: "TRY" });
@@ -152,6 +237,89 @@ const fmtDate = new Intl.DateTimeFormat("tr-TR", { dateStyle: "short", timeStyle
 
 let rows = [];
 let sortKey = null, sortAsc = true;
+let SITES = [];  // /api/sites yanıtı (site, description, parameters, properties)
+
+const PARAM_LABELS = {
+  query: "Arama", origin: "Kalkış", destination: "Varış",
+  departure_date: "Gidiş Tarihi", return_date: "Dönüş Tarihi", date: "Tarih",
+};
+
+function siteInfo(site) { return SITES.find((s) => s.site === site) || null; }
+
+function paramList(site) {
+  const info = siteInfo(site);
+  return info && info.parameters && info.parameters.length ? info.parameters : ["query"];
+}
+
+// Zorunlu parametreler; şema belirtmemişse tümü zorunlu sayılır.
+function requiredList(site) {
+  const info = siteInfo(site);
+  return info && Array.isArray(info.required) ? info.required : paramList(site);
+}
+
+function exampleFor(info, name) {
+  const desc = (info && info.properties && info.properties[name] && info.properties[name].description) || "";
+  const m = desc.match(/örnek format:\s*([^)]+)/i);
+  return m ? m[1].trim() : "";
+}
+
+// Form alanlarını site parametrelerine göre kurar: tek "query" ise tek kutu, çoklu ise her alana ayrı kutu.
+function renderForm(site) {
+  const info = siteInfo(site);
+  const params = paramList(site);
+  const required = new Set(requiredList(site));
+  const box = $("paramFields");
+  box.replaceChildren();
+  const single = params.length === 1 && params[0] === "query";
+  for (const name of params) {
+    const inp = document.createElement("input");
+    inp.id = "param_" + name;
+    inp.type = "text";
+    inp.autocomplete = "off";
+    if (single) {
+      inp.placeholder = "Ne arıyorsunuz? (örn. saat)";
+      box.append(inp);
+      continue;
+    }
+    const label = PARAM_LABELS[name] || name;
+    const ex = exampleFor(info, name);
+    inp.placeholder = ex ? `${label} (örn: ${ex})` : label;
+    inp.title = name;
+    // Etiket: alan adı + Zorunlu/(Opsiyonel) ibaresi.
+    const wrap = document.createElement("label"); wrap.className = "field";
+    const cap = document.createElement("span"); cap.className = "cap";
+    cap.textContent = label + " ";
+    const tag = document.createElement("em");
+    const isReq = required.has(name);
+    tag.className = isReq ? "req" : "opt";
+    tag.textContent = isReq ? "Zorunlu" : "(Opsiyonel)";
+    cap.append(tag);
+    wrap.append(cap, inp);
+    box.append(wrap);
+  }
+}
+
+function collectParams(site) {
+  const out = {};
+  for (const name of paramList(site)) {
+    const el = $("param_" + name);
+    out[name] = el ? el.value.trim() : "";
+  }
+  return out;
+}
+
+// Vault/geçmiş etiketi: tek query → kelime; çoklu → "IST → ESB, 18-11-2026".
+function describeParams(params) {
+  if (!params) return "";
+  const keys = Object.keys(params);
+  if (keys.length === 1 && keys[0] === "query") return params.query;
+  const route = (params.origin || params.destination)
+    ? `${params.origin || "?"} → ${params.destination || "?"}` : "";
+  const rest = keys
+    .filter((k) => k !== "origin" && k !== "destination")
+    .map((k) => params[k]).filter(Boolean);
+  return [route, ...rest].filter(Boolean).join(", ");
+}
 
 function setStatus(text, kind = "", loading = false) {
   const el = $("status");
@@ -225,12 +393,107 @@ document.querySelectorAll("th[data-sort]").forEach(th => {
   });
 });
 
-async function search(site, q) {
-  $("searchBtn").disabled = true;
-  setStatus(`${site} üzerinde "${q}" aranıyor... (Chrome açılıyor, birkaç saniye sürebilir)`, "", true);
+// ---- API anahtarı yönetimi ----
+const KEY_STORAGE = "own_api_key";
+
+async function ensureApiKey() {
+  let key = null;
+  try { key = localStorage.getItem(KEY_STORAGE); } catch { /* özel pencere */ }
+  if (key) return key;
+  // Panelin kendi varsayılan anahtarı: arka planda üret ve sakla.
+  const resp = await fetch("/api/keys", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "panel" }),
+  });
+  if (!resp.ok) throw new Error(`Anahtar üretilemedi (HTTP ${resp.status})`);
+  const data = await resp.json();
+  key = data.key;
+  try { localStorage.setItem(KEY_STORAGE, key); } catch { /* yoksay */ }
+  return key;
+}
+
+async function loadKeys() {
+  const list = $("keylist");
+  list.replaceChildren();
+  let current = null;
+  try { current = localStorage.getItem(KEY_STORAGE); } catch { /* */ }
   try {
-    const resp = await fetch(`/api/${encodeURIComponent(site)}/search?q=${encodeURIComponent(q)}`);
+    const keys = await (await fetch("/api/keys")).json();
+    if (!keys.length) {
+      const li = document.createElement("li"); li.className = "empty";
+      li.textContent = "Henüz anahtar yok."; list.append(li); return;
+    }
+    for (const k of keys) {
+      const li = document.createElement("li");
+      const info = document.createElement("div");
+      const nm = document.createElement("div"); nm.className = "kname";
+      nm.textContent = k.name + (current && current.endsWith(k.key_masked.slice(-4)) ? "  (bu panel)" : "");
+      const meta = document.createElement("div"); meta.className = "kmeta";
+      meta.textContent = `${fmtDate.format(new Date(k.created_at))}`;
+      info.append(nm, meta);
+      const code = document.createElement("code"); code.textContent = k.key_masked;
+      li.append(info, code);
+      list.append(li);
+    }
+  } catch {
+    const li = document.createElement("li"); li.className = "empty";
+    li.textContent = "Anahtarlar yüklenemedi."; list.append(li);
+  }
+}
+
+async function generateKey() {
+  const btn = $("genKeyBtn"); btn.disabled = true;
+  try {
+    const resp = await fetch("/api/keys", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "manuel" }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    $("newkeyValue").value = data.key;
+    $("newkey").classList.add("show");
+    await loadKeys();
+  } catch (e) {
+    alert("Anahtar üretilemedi: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function openKeys() {
+  $("newkey").classList.remove("show");
+  $("newkeyValue").value = "";
+  $("keysOverlay").classList.add("open");
+  loadKeys();
+}
+function closeKeys() { $("keysOverlay").classList.remove("open"); }
+
+$("keysBtn").addEventListener("click", openKeys);
+$("keysClose").addEventListener("click", closeKeys);
+$("keysOverlay").addEventListener("click", (e) => { if (e.target === $("keysOverlay")) closeKeys(); });
+$("genKeyBtn").addEventListener("click", generateKey);
+$("copyKeyBtn").addEventListener("click", async () => {
+  const val = $("newkeyValue").value;
+  if (!val) return;
+  try { await navigator.clipboard.writeText(val); }
+  catch { $("newkeyValue").select(); document.execCommand("copy"); }
+  $("copyKeyBtn").textContent = "Kopyalandı ✓";
+  setTimeout(() => { $("copyKeyBtn").textContent = "Kopyala"; }, 1500);
+});
+
+async function search(site, params) {
+  $("searchBtn").disabled = true;
+  const label = describeParams(params);
+  setStatus(`${site} üzerinde "${label}" aranıyor... (Chrome açılıyor, birkaç saniye sürebilir)`, "", true);
+  try {
+    const key = await ensureApiKey();
+    const qs = new URLSearchParams(params).toString();
+    const resp = await fetch(`/api/${encodeURIComponent(site)}/search?${qs}`,
+      { headers: { "Authorization": `Bearer ${key}` } });
     const data = await resp.json().catch(() => ({}));
+    if (resp.status === 401) throw new Error("Yetkisiz (401) — API anahtarı geçersiz. 🔑 API Keys'ten yeni anahtar üretin.");
     if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
     rows = (data.results || []).map(r => ({ ...r, site: data.site, priceNum: toNumber(r.price) }));
     sortKey = null;
@@ -261,18 +524,26 @@ async function loadRecent() {
     for (const it of items) {
       const li = document.createElement("li");
       li.title = "Bu aramayı tekrar çalıştır";
-      const q = document.createElement("div"); q.className = "q"; q.textContent = it.query;
+      const q = document.createElement("div"); q.className = "q";
+      q.textContent = (it.params && describeParams(it.params)) || it.query;
       const meta = document.createElement("div"); meta.className = "meta";
       const left = document.createElement("span");
-      left.textContent = `${it.site} · ${it.result_count} ürün · ${fmtDate.format(new Date(it.timestamp))}`;
+      left.textContent = `${it.site} · ${it.result_count} sonuç · ${fmtDate.format(new Date(it.timestamp))}`;
       const right = document.createElement("span"); right.className = "min";
       right.textContent = it.min_price != null ? fmtPrice.format(it.min_price) : "";
       meta.append(left, right);
       li.append(q, meta);
       li.addEventListener("click", () => {
-        $("query").value = it.query;
-        if ([...$("site").options].some(o => o.value === it.site)) $("site").value = it.site;
-        search(it.site, it.query);
+        const params = it.params || { query: it.query };
+        if ([...$("site").options].some(o => o.value === it.site)) {
+          $("site").value = it.site;
+          renderForm(it.site);
+        }
+        for (const [k, v] of Object.entries(params)) {
+          const el = $("param_" + k);
+          if (el) el.value = v;
+        }
+        search(it.site, params);
       });
       list.append(li);
     }
@@ -285,28 +556,42 @@ async function loadRecent() {
 
 async function loadSites() {
   try {
-    const sites = await (await fetch("/api/sites")).json();
-    if (!sites.length) return;
+    SITES = await (await fetch("/api/sites")).json();
+    if (!SITES.length) return;
     const sel = $("site");
     sel.replaceChildren();
-    for (const s of sites) {
+    for (const s of SITES) {
       const o = document.createElement("option");
       o.value = s.site; o.textContent = s.site; o.title = s.description || "";
       sel.append(o);
     }
-    if (sites.some(s => s.site === "trendyol")) sel.value = "trendyol";
-  } catch { /* varsayılan trendyol kalır */ }
+    if (SITES.some(s => s.site === "trendyol")) sel.value = "trendyol";
+    renderForm(sel.value);
+  } catch { /* varsayılan tekli query formu kalır */ }
 }
+
+$("site").addEventListener("change", () => renderForm($("site").value));
 
 $("searchForm").addEventListener("submit", (e) => {
   e.preventDefault();
-  const q = $("query").value.trim();
-  if (!q) { $("query").focus(); return; }
-  search($("site").value, q);
+  const site = $("site").value;
+  const params = collectParams(site);
+  // Sadece zorunlu alanlar dolu olmalı; opsiyonel alanlar (örn. return_date) boş kalabilir.
+  const empty = requiredList(site).find(k => !params[k]);
+  if (empty) {
+    const el = $("param_" + empty);
+    if (el) el.focus();
+    setStatus("Lütfen zorunlu alanları doldurun.", "err");
+    return;
+  }
+  // Boş opsiyonel alanları gönderme (tek yön uçuşta return_date gibi).
+  for (const k of Object.keys(params)) if (!params[k]) delete params[k];
+  search(site, params);
 });
 
 loadSites();
 loadRecent();
+ensureApiKey().catch(() => { /* ilk aramada tekrar denenir */ });
 </script>
 </body>
 </html>

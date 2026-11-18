@@ -1,4 +1,4 @@
-"""Recorder — kullanıcı sitede gezinirken JSON API trafiğini yakalar.
+"""Recorder — kullanıcı sitede gezinirken JSON API ve SSR HTML trafiğini yakalar.
 
 ChromeBridge'in kalıcı profilini kullanır (gerçek Chrome, gerçek oturum).
 
@@ -8,6 +8,8 @@ ChromeBridge'in kalıcı profilini kullanır (gerçek Chrome, gerçek oturum).
   uçuş/fiyat yanıtları kaçmaz.
 - "flight", "fare", "segment", "price" gibi kelimeler geçen yanıtlar işaretlenir
   ve listenin başına alınır (hiçbir yanıt silinmez).
+- JSON'a ek olarak, MIN_HTML_CHARS'tan büyük text/html yanıtları da kaydedilir
+  (Sahibinden, Hepsiburada gibi veriyi sunucuda render eden siteler için).
 """
 
 from __future__ import annotations
@@ -34,10 +36,16 @@ KEYWORD_SCAN_CHARS = 300_000  # büyük gövdelerde aranacak en fazla karakter
 IDLE_QUIET_SECONDS = 1.5   # bu kadar süre yeni istek olmazsa trafik durmuş sayılır
 IDLE_TIMEOUT_SECONDS = 20  # en fazla bu kadar beklenir (long-polling vb. için)
 
+MIN_HTML_CHARS = 10_000  # bundan küçük HTML yanıtlar (iframe, hata, boş şablon) kaydedilmez
+
 
 def _is_json(content_type: str) -> bool:
     ct = content_type.lower()
     return "application/json" in ct or "+json" in ct
+
+
+def _is_html(content_type: str) -> bool:
+    return "text/html" in content_type.lower()
 
 
 def _keywords(entry: dict) -> list[str]:
@@ -92,17 +100,24 @@ class Recorder:
 
     async def _handle_response(self, response: Response) -> None:
         content_type = response.headers.get("content-type", "")
-        if not _is_json(content_type):
+        is_json = _is_json(content_type)
+        is_html = not is_json and _is_html(content_type)
+        if not (is_json or is_html):
             return
         request = response.request
         try:
             text = await response.text()
         except Exception:
             return  # gövde alınamadı (redirect, sayfa kapandı vb.)
-        try:
-            body = json.loads(text)
-        except (ValueError, TypeError):
-            body = text
+        if is_html:
+            if len(text) <= MIN_HTML_CHARS:
+                return
+            body = text  # HTML ham metin olarak saklanır
+        else:
+            try:
+                body = json.loads(text)
+            except (ValueError, TypeError):
+                body = text
         try:
             headers = await request.all_headers()
         except Exception:
@@ -121,6 +136,7 @@ class Recorder:
             "post_data": request.post_data,
             "page_url": page_url,
             "resource_type": request.resource_type,
+            "format": "html" if is_html else "json",
         }
         entry["keywords"] = _keywords(entry)
         self._captured.append(entry)
@@ -167,7 +183,7 @@ class Recorder:
     # ana akış
     # ------------------------------------------------------------------ #
     async def capture(self, url: str, intent: str) -> list[dict]:
-        """URL'yi açar, kullanıcı ENTER'a basıp trafik durana kadar JSON yanıtlarını toplar."""
+        """URL'yi açar, kullanıcı ENTER'a basıp trafik durana kadar JSON/HTML yanıtlarını toplar."""
         self._captured = []
         self._inflight = set()
         self._visited = []
@@ -220,8 +236,9 @@ class Recorder:
 
         matched = [e for e in traffic if e["keywords"]]
         pages_seen = {e.get("page_url") for e in traffic if e.get("page_url")}
+        html_count = sum(1 for e in traffic if e.get("format") == "html")
         print(
-            f"📦 {len(traffic)} JSON yanıt, {len(pages_seen)} sayfadan; "
+            f"📦 {len(traffic) - html_count} JSON + {html_count} HTML yanıt, {len(pages_seen)} sayfadan; "
             f"{len(matched)} tanesinde {'/'.join(PRIORITY_KEYWORDS[:4])}... geçiyor."
         )
         for e in matched[:5]:

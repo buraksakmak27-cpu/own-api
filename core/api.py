@@ -18,8 +18,9 @@ import re
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -29,7 +30,7 @@ PANEL_FILE = PROJECT_ROOT / "panel" / "index.html"
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from core import audit, passport, vault  # noqa: E402
+from core import audit, auth_keys, passport, vault  # noqa: E402
 
 SITE_RE = re.compile(r"^[a-z0-9_-]+$", re.IGNORECASE)
 
@@ -70,17 +71,57 @@ async def sites() -> list[dict]:
         for d in sorted(REGISTRY_DIR.iterdir()):
             if not (d / "client.py").is_file():
                 continue
-            desc, params = "", ["query"]
+            desc, params, props, required = "", ["query"], {}, None
             schema = d / "schema.json"
             if schema.is_file():
                 try:
                     data = json.loads(schema.read_text(encoding="utf-8"))
                     desc = data.get("description", "")
-                    params = list((data.get("inputSchema") or {}).get("properties") or params)
+                    input_schema = data.get("inputSchema") or {}
+                    props = input_schema.get("properties") or {}
+                    params = list(props) or params
+                    required = input_schema.get("required")
                 except (OSError, json.JSONDecodeError, AttributeError):
                     pass
-            out.append({"site": d.name, "description": desc, "parameters": params})
+            # required belirtilmemişse tüm parametreler zorunlu sayılır.
+            if required is None:
+                required = list(params)
+            out.append(
+                {
+                    "site": d.name, "description": desc,
+                    "parameters": params, "properties": props, "required": required,
+                }
+            )
     return out
+
+
+async def verify_api_key(authorization: Optional[str] = Header(None)) -> str:
+    """Authorization: Bearer <key> başlığını doğrular; geçersizse 401 döner."""
+    scheme, _, key = (authorization or "").partition(" ")
+    key = key.strip()
+    if scheme.lower() != "bearer" or not key:
+        raise HTTPException(
+            401, "Authorization: Bearer <key> başlığı gerekli.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not await auth_keys.verify_key(key):
+        raise HTTPException(
+            401, "Geçersiz API anahtarı.", headers={"WWW-Authenticate": "Bearer"}
+        )
+    return key
+
+
+@app.post("/api/keys")
+async def create_api_key(payload: Optional[dict] = Body(None)) -> dict:
+    """Yeni API anahtarı üretir. Tam anahtar ('key') YALNIZCA bu yanıtta döner."""
+    name = str((payload or {}).get("name") or "api")[:60]
+    return await auth_keys.create_key(name)
+
+
+@app.get("/api/keys")
+async def list_api_keys() -> list[dict]:
+    """Kayıtlı anahtarları maskeli (son 4 hane) listeler."""
+    return await auth_keys.list_keys()
 
 
 @app.get("/api/vault/recent")
@@ -125,7 +166,7 @@ def _query_label(kwargs: dict) -> str:
 
 
 @app.get("/api/{site}/search")
-async def search(site: str, request: Request) -> dict:
+async def search(site: str, request: Request, _key: str = Depends(verify_api_key)) -> dict:
     client = _load_client(site)
     func = getattr(client, "search", None)
     if func is None:
@@ -147,7 +188,7 @@ async def search(site: str, request: Request) -> dict:
         results = []
     label = _query_label(kwargs)
     audit.log_event("panel", site, "search", kwargs, "ok", result_count=len(results))
-    saved = await vault.save_results(site, label, results)
+    saved = await vault.save_results(site, label, results, params=kwargs)
     return {
         "site": site, "query": label, "params": kwargs,
         "count": len(results), "saved": saved, "results": results,

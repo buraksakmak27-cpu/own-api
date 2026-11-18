@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS prices (
     product_name  TEXT NOT NULL,
     price         REAL,
     search_query  TEXT NOT NULL,
+    params_json   TEXT,
     timestamp     TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_prices_site_query ON prices (site, search_query, timestamp);
@@ -33,6 +35,10 @@ def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # Eski vault.db'ler için geçiş: params_json kolonu yoksa ekle.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(prices)")}
+    if "params_json" not in cols:
+        conn.execute("ALTER TABLE prices ADD COLUMN params_json TEXT")
     return conn
 
 
@@ -81,9 +87,10 @@ def _pick(item: dict, keys: tuple[str, ...]) -> Any:
 # --------------------------------------------------------------------------- #
 # senkron çekirdek (asyncio.to_thread ile çağrılır)
 # --------------------------------------------------------------------------- #
-def _save(site: str, query: str, results: list[dict]) -> int:
+def _save(site: str, query: str, results: list[dict], params: Optional[dict] = None) -> int:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     q = _normalize_query(query)
+    params_json = json.dumps(params, ensure_ascii=False, sort_keys=True) if params else None
     rows = []
     for item in results:
         if not isinstance(item, dict):
@@ -91,13 +98,13 @@ def _save(site: str, query: str, results: list[dict]) -> int:
         name = _pick(item, NAME_KEYS)
         if not name:
             continue
-        rows.append((site, str(name), parse_price(_pick(item, PRICE_KEYS)), q, now))
+        rows.append((site, str(name), parse_price(_pick(item, PRICE_KEYS)), q, params_json, now))
     if not rows:
         return 0
     with _connect() as conn:
         conn.executemany(
-            "INSERT INTO prices (site, product_name, price, search_query, timestamp) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO prices (site, product_name, price, search_query, params_json, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
             rows,
         )
     return len(rows)
@@ -108,6 +115,7 @@ def _recent(limit: int) -> list[dict]:
         rows = conn.execute(
             """
             SELECT site, search_query AS query, timestamp,
+                   MAX(params_json) AS params_json,
                    COUNT(*) AS result_count,
                    MIN(price) AS min_price, MAX(price) AS max_price, AVG(price) AS avg_price
             FROM prices
@@ -117,7 +125,16 @@ def _recent(limit: int) -> list[dict]:
             """,
             (limit,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        raw = d.pop("params_json", None)
+        try:
+            d["params"] = json.loads(raw) if raw else None
+        except (ValueError, TypeError):
+            d["params"] = None
+        out.append(d)
+    return out
 
 
 def _history(site: str, query: str) -> list[dict]:
@@ -139,9 +156,14 @@ def _history(site: str, query: str) -> list[dict]:
 # --------------------------------------------------------------------------- #
 # async API
 # --------------------------------------------------------------------------- #
-async def save_results(site: str, query: str, results: list[dict]) -> int:
-    """Sonuçları kaydeder; kaydedilen satır sayısını döndürür."""
-    return await asyncio.to_thread(_save, site, query, results)
+async def save_results(
+    site: str, query: str, results: list[dict], params: Optional[dict] = None
+) -> int:
+    """Sonuçları kaydeder; kaydedilen satır sayısını döndürür.
+
+    params: çoklu parametreli aramalar için tüm parametreler (params_json'a yazılır).
+    """
+    return await asyncio.to_thread(_save, site, query, results, params)
 
 
 async def get_recent_searches(limit: int = 20) -> list[dict]:

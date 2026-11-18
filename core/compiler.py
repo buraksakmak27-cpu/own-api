@@ -1,5 +1,9 @@
 """AI Compiler — yakalanan trafikten site istemcisi (client.py + schema.json) üretir.
 
+JSON API'ler (Trendyol, THY) ve SSR HTML sayfaları (Sahibinden, Hepsiburada) desteklenir.
+HTML'de önce gömülü JSON (__NEXT_DATA__ vb.) aranır; yoksa CSS selector'larla ayrıştırılır
+(üretilen client.py BeautifulSoup kullanır).
+
 OpenAI API kullanır (OPENAI_API_KEY ortam değişkeni).
 Model OPENAI_MODEL ile değiştirilebilir (varsayılan: gpt-4o).
 """
@@ -9,12 +13,50 @@ from __future__ import annotations
 import json
 import keyword
 import os
+import re
+from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, unquote, urlparse
 
 from openai import AsyncOpenAI
 
 from core.traffic_filter import filter_useful
+
+
+def normalize_date(value, out_format: str = "%d-%m-%Y", refresh_past: bool = True, today=None):
+    """Tarih metnini tek biçime (varsayılan THY'nin beklediği %d-%m-%Y) çevirir.
+
+    - Ayraç/sıra farkını giderir: 02.03.2027 / 02/03/2027 / 2027-03-02 → 02-03-2027
+    - Tek haneleri sıfırla doldurur: 2.3.2027 → 02-03-2027
+    - ISO saat eki varsa atar: 2027-03-02T10:00 → 02-03-2027
+    - refresh_past=True ise geçmişte kalan tarihi bugüne çeker (THY boş döndürmesin).
+    - Tarih olarak çözülemezse değeri AYNEN döndürür (örn. 'IST').
+    """
+    if not isinstance(value, str):
+        return value
+    s = value.strip()
+    if not s:
+        return value
+    head = re.split(r"[ T]", s, 1)[0]           # saat kısmını at
+    parts = re.split(r"[-./]", head)
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return value
+    a, b, c = parts
+    if len(a) == 4:                              # YYYY-M-D
+        y, m, d = a, b, c
+    elif len(c) == 4:                            # D-M-YYYY (TR/AB)
+        d, m, y = a, b, c
+    else:
+        return value                             # yıl belirsiz
+    try:
+        parsed = date(int(y), int(m), int(d))
+    except ValueError:
+        return value                             # 31-02 gibi geçersiz tarih
+    if refresh_past:
+        ref = today or date.today()
+        if parsed < ref:
+            parsed = ref
+    return parsed.strftime(out_format)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 REGISTRY_DIR = PROJECT_ROOT / "registry"
@@ -23,17 +65,43 @@ DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o")
 
 MAX_ENTRIES = 50          # AI'a gönderilecek en fazla istek (traffic_filter.MAX_ENTRIES)
 MAX_BODY_CHARS = 2000     # her yanıt gövdesinden gönderilecek önizleme
+MAX_HTML_CHARS = 50_000   # temizlenmiş HTML bundan uzunsa baştan+sondan kesilir, ortası atılır
+MAX_HTML_FULL = 2         # tam (50K'ya kadar) gönderilecek HTML sayısı; diğerleri MAX_BODY_CHARS önizleme
 
-PROMPT_TEMPLATE = """Aşağıda bir web sitesinden yakalanmış JSON API istekleri var.
+PROMPT_TEMPLATE = """Aşağıda bir web sitesinden yakalanmış istekler var: JSON API yanıtları ve
+sunucuda render edilmiş (SSR) HTML sayfaları. Her isteğin "format" alanı "json" veya "html"dir.
 Kullanıcının amacı: {intent}.
-Bu istekler arasından arama sonuçlarını dönen doğru endpoint'i bul.
+Bu istekler arasından arama sonuçlarını dönen doğru isteği bul.
 
-ÖNEMLİ: Sana verilen trafikte SADECE `application/json` içerik tipine sahip yanıtları seç
-(her isteğin "content_type" alanına bak). `text/html` dönen istekleri asla seçme.
-Eğer arama sonuçları JSON değil de HTML içinde geliyorsa, uygun bir JSON endpoint'i bulana
-kadar diğer istekleri incele. Eğer hiç JSON yoksa (veya arama sonuçlarını dönen bir JSON
-endpoint'i yoksa) hata döndür; bu durumda SADECE şunu dön:
-{{"error": "neden uygun JSON endpoint bulunamadığının kısa açıklaması"}}
+ÖNCELİK: Arama sonuçlarını içeren bir JSON API yanıtı varsa onu seç (`parser_type: "json"`).
+Sonuçlar sadece HTML sayfasının içindeyse o HTML isteğini seç (`parser_type: "html"`).
+Hiçbir istekte arama sonuçları yoksa SADECE şunu dön:
+{{"error": "neden uygun istek bulunamadığının kısa açıklaması"}}
+
+HTML SAYFALARI: Sana bir HTML sayfası gönderiyorum (script/style/svg temizlenmiş, çok uzunsa
+ortası kesilmiş olabilir).
+
+JSON-LD UYARISI: Eğer sayfada `application/ld+json` varsa, bunu SADECE tekil ürün detay sayfaları
+için kullan. Arama sonuçları (liste) sayfalarında JSON-LD'ye ALDANMA: o etiket sitenin SEO
+bilgilerini tutar, arama sonuçlarının listesini değil. Arama sonuçları her zaman HTML elementleridir.
+İlanları/ürünleri seçmek için mutlaka bir CSS Selector (`items_selector`, örn: `.searchResultsItem`,
+`.product-list-item`) bul. Her ilanın içindeki isim, fiyat ve link için de alt CSS Selector'lar üret:
+- `embedded_json` ve `items_path` null olsun; `items_selector` ASLA boş olamaz.
+- `items_selector`: her bir ürünü/ilanı (tek satır/kart) seçen CSS selector (örn: "tr.searchResultsItem").
+- `fields`: öğenin İÇİNDE aranacak alt CSS selector'lar (örn: {{"name": "a.classifiedTitle", "price": "td.searchResultsPriceValue"}}).
+  Varsayılan olarak etiketin metni alınır. Bir öznitelik gerekiyorsa `selector@öznitelik` yaz
+  (örn: {{"link": "a.classifiedTitle@href"}}); öğenin kendi özniteliği için sadece "@href".
+- Selector'lar sayfadaki gerçek, kalıcı class/id/öznitelikleri kullansın; rastgele üretilmiş
+  (örn: "css-1x2y3z", "sc-abc123") class'lardan kaçın.
+TEK İSTİSNA (gömülü veri JSON'u): Arama sonuçlarının TAM listesi `<script id="__NEXT_DATA__">` veya
+`<script type="application/json">` içindeyse CSS yerine onu kullanabilirsin:
+- `embedded_json`: o script etiketinin CSS selector'ı (örn: "script#__NEXT_DATA__").
+- `items_path`: o JSON içindeki ürün/ilan listesinin noktalı yolu (örn: props.pageProps.products).
+- `fields`: her alanın öğe içindeki noktalı JSON yolu.
+`application/ld+json` etiketi ASLA `embedded_json` olarak kullanılamaz. Emin değilsen `items_selector` kullan.
+Bana `parser_type: 'html'` formatında JSON dön. HTML isteklerinde `method` "GET" olmalı;
+`query_param` / `query_templates` / `drop_params` kuralları GET ile aynıdır (arama kelimesi
+sayfa URL'sinin hangi parametresinde?). `body_template` ve `parameters` null olmalı.
 
 POST İSTEKLERİ: Her isteğin "post_data" alanına da bak. Eğer arama kelimesi URL'de değil de
 POST isteğinin `post_data` (JSON body) içinde geçiyorsa, bu endpoint'i seç ve `method: "POST"` dön.
@@ -48,8 +116,9 @@ içeriyorsa, bunları tespit et. Bana `body_template` (orijinal POST gövdesi) v
 - Tek bir arama kelimesi varsa: {{"query": "<yol>"}}.
 GET isteklerinde `body_template` ve `parameters` null olmalı.
 
-Uygun endpoint bulursan bana sadece şu formatta bir JSON dön:
+Uygun istek bulursan bana sadece şu formatta bir JSON dön:
 {{
+  "parser_type": "json veya html",
   "endpoint_name": "search",
   "request_index": "seçtiğin isteğin index numarası (sayı)",
   "url": "tam_url",
@@ -59,13 +128,132 @@ Uygun endpoint bulursan bana sadece şu formatta bir JSON dön:
   "query_param": "arama kelimesinin doğrudan gönderileceği query parametresinin adı (örn: q) veya null. Sayfa yolu/kategori taşıyan bir parametre (örn: source=sr?tag=...) OLMAMALI",
   "query_templates": {{"source": "endpoint sayfa yolunu bir parametrede taşıyorsa (örn: source=sr%3Ftag%3D...), o parametre için sitenin ARAMA sayfası yolunun şablonu; arama kelimesi yerine {{query}} yaz (örn: sr?q={{query}}). Böyle parametre yoksa boş obje {{}} dön"}},
   "drop_params": ["yakalanan sayfanın bağlamını taşıyan, aramada silinmesi gereken parametreler (kategori, etiket, sıralama, source vb.)"],
-  "items_path": "json içindeki ürünlerin listesine giden yol (örn: data.products)",
-  "fields": {{"name": "ürün adı yolu (örn: name)", "price": "fiyat yolu (örn: price.current)"}}
+  "items_path": "json (veya HTML'deki gömülü JSON) içindeki ürünlerin listesine giden yol (örn: data.products); HTML+CSS'te null",
+  "embedded_json": "sadece html: gömülü JSON script'inin CSS selector'ı (örn: script#__NEXT_DATA__) veya null",
+  "items_selector": "html'de ZORUNLU (sadece __NEXT_DATA__ istisnasında null): her ürünü/ilanı seçen CSS selector; json'da null",
+  "fields": {{"name": "ürün adı yolu (örn: name) veya CSS selector", "price": "fiyat yolu (örn: price.current) veya CSS selector", "link": "html'de örn: a.title@href"}},
+  "waf_detected": "true veya false (boolean) — aşağıdaki WAF kurallarına göre",
+  "waf_origin_template": "WAF varsa ve page_url'de rastgele parametre (cId/token...) varsa, o değerin yerine {{uuid}} yazılmış page_url (örn: https://www.turkishairlines.com/tr-tr/ucak-bileti/rezervasyon/ic-hat-musaitlik/?cId={{uuid}}); aksi halde null",
+  "waf_headers_to_capture": ["WAF varsa: yakalanacak x- başlık adları (örn: x-pgs-token, x-session-id); WAF yoksa null"],
+  "origin_url": "isteğin yapıldığı sayfa ana siteden (www) farklı bir alt alan adındaysa onun origin'i (örn: https://web.site.com/), aksi halde null"
 }}
+
+WAF (Akamai/PerimeterX) TESPİTİ: Her isteğin "waf_headers" alanında, o istekte gönderilen `x-` ile
+başlayan başlıkların SADECE ADLARI var (değerleri gizlilik için gönderilmez).
+- Eğer yakalanan isteklerin herhangi birinde `x-bfp` veya benzeri (x- ile başlayan) gizli WAF
+  başlıkları varsa, bu site bir WAF (Akamai/PerimeterX) kullanıyordur → `waf_detected: true`.
+  (`x-requested-with`, `x-csrf-token`, `x-xsrf-token`, `x-client-timestamp` gibi standart başlıklar
+  tek başına WAF işareti DEĞİLDİR.)
+- WAF tespit edersen, o isteğin yapıldığı `page_url`'e bak. Eğer `page_url` içinde `cId=...` veya
+  `token=...` gibi rastgele bir parametre varsa, `waf_origin_template` olarak o page_url'i dön ve
+  rastgele değerin yerine `{{uuid}}` yaz (üretilen kod Healer'ı başlatırken
+  `origin=f'...?cId={{uuid.uuid4()}}'` şeklinde dinamik bir URL kullanacak).
+- Eğer `page_url`'de böyle bir parametre yoksa ama WAF varsa, yine de `waf_detected: true` dön ama
+  `waf_origin_template` null olsun (Healer normal origin ile kullanılır).
+- WAF yoksa `waf_detected: false`, `waf_origin_template: null`.
+- Sana verilen 'waf_headers' dizisindeki (örn: `x-pgs-token`) başlık isimlerini
+  `waf_headers_to_capture` olarak döndür (öncelikle seçtiğin isteğin waf_headers'ı; standart
+  `x-requested-with` gibi başlıkları ekleme). Eğer WAF yoksa null dön.
+- Eğer test isteği 406 (Not Acceptable) hatası alırsa, bu site eksik başlıklar istiyor demektir.
+  Bu durumda `waf_detected: true` yap ve `waf_headers_to_capture` alanına sayfadaki tüm `x-`
+  başlıklarını listele. (Yakalanan trafikte "status": 406 olan bir istek varsa da aynısını yap.)
+  "Sayfadaki tüm x- başlıkları" = seçtiğin API isteğiyle AYNI host'a giden isteklerin x- başlıkları
+  (örn. Pegasus: x-platform, x-version). Üçüncü taraf servislerin (google, firebase, analitik)
+  başlıklarını ve `x-forwarded-for`, `x-real-ip`, `x-forwarded-host` gibi proxy başlıklarını ASLA koyma.
+
+ORIGIN (CORS): Eğer API endpoint'i ana siteden farklı bir alt alan adındaysa (örn: web.site.com,
+api.site.com), `origin_url` adında bir alan döndür ve buraya API'nin tam origin'ini yaz
+(örn: https://web.site.com/). Ana site ile aynıysa null dön. Belirleyici olan, isteğin yapıldığı
+SAYFADIR (`page_url`): istek web.site.com/booking sayfasından yapıldıysa origin_url
+"https://web.site.com/" olur; istek www.site.com sayfasından api.site.com'a yapıldıysa (sayfa ana
+sitedeyse) null dön.
+
+ALAN EŞLEŞTİRME (fields): Uçuş sonuçlarında (`departureRouteList`), uçuş numarası genellikle
+`flightNumber` veya `flightCode` içindedir. Fiyat ise `price`, `fare`, veya `amount` alanlarındadır.
+Lütfen bu yapıyı çok dikkatli incele ve `fields` sözlüğünü (name ve price) doldur. `fields` ASLA
+null veya boş olamaz; yollar `items_path` listesindeki TEK BİR öğeye göredir (örn: "flightNumber",
+"fare.amount", "segments.0.flightCode").
 
 İstekler:
 {requests}
 """
+
+
+_KEEP_SCRIPT_TYPES = ("application/json", "application/ld+json")
+
+
+def _is_data_script(tag) -> bool:
+    """Veri taşıyan script mi? (__NEXT_DATA__ veya type=application/json / ld+json)"""
+    if tag.name != "script":
+        return False
+    if (tag.get("id") or "") == "__NEXT_DATA__":
+        return True
+    typ = (tag.get("type") or "").lower().split(";")[0].strip()
+    return typ in _KEEP_SCRIPT_TYPES or typ.endswith("+json")
+
+
+def _clean_html(html_text: str, limit: int = MAX_HTML_CHARS) -> str:
+    """AI'a gönderilecek HTML'i küçültür.
+
+    - <script>, <style>, <svg>, <noscript> etiketlerini içerikleriyle siler; veri taşıyan
+      script'ler (__NEXT_DATA__, type="application/json") KORUNUR.
+    - HTML yorumlarını siler, boşluk/yeni satırları sıkıştırır (minify).
+    - Hâlâ `limit`ten uzunsa baştan ve sondan keser, ortasını atar.
+    """
+    from bs4 import BeautifulSoup, Comment  # lazy: sadece HTML işlenirken gerekli
+
+    if not html_text:
+        return ""
+    soup = BeautifulSoup(html_text, "html.parser")
+    for tag in soup.find_all(["script", "style", "svg", "noscript"]):
+        if tag.decomposed or _is_data_script(tag):
+            continue
+        tag.decompose()
+    for comment in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        comment.extract()
+
+    text = str(soup)
+    text = re.sub(r">\s+<", "><", text)   # etiketler arası boşluk
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if len(text) > limit:
+        cut = len(text) - limit
+        head = limit // 2
+        tail = limit - head
+        text = f"{text[:head]} ...(ortası kesildi: {cut} karakter)... {text[-tail:]}"
+    return text
+
+
+def _is_html_entry(entry: dict) -> bool:
+    return entry.get("format") == "html" or "text/html" in (entry.get("content_type") or "").lower()
+
+
+def _is_ld_json(tag) -> bool:
+    return "ld+json" in (tag.get("type") or "").lower()
+
+
+class _SpecRetry(ValueError):
+    """AI cevabı düzeltilebilir şekilde hatalı — hata mesajıyla AI'a tekrar sorulur."""
+
+
+MAX_AI_ATTEMPTS = 3  # ilk soru + en fazla 2 düzeltme denemesi
+
+
+def _extract_embedded_json(html_text: str, selector: str, items_path: str | None = None):
+    """HTML'de selector'a uyan script'lerden ilk geçerli JSON'u döner (items_path varsa onu içereni)."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    for tag in soup.select(selector):
+        if _is_ld_json(tag):
+            continue  # JSON-LD = SEO verisi, arama sonucu listesi değil
+        try:
+            data = json.loads(tag.string or tag.get_text() or "")
+        except (TypeError, ValueError):
+            continue
+        if not items_path or _path_exists(data, items_path):
+            return data
+    return None
 
 
 def _truncate(text, limit: int = MAX_BODY_CHARS):
@@ -140,21 +328,188 @@ def _find_entry(entries: list[dict], spec: dict) -> dict | None:
     return None
 
 
-def _summarize(entry: dict, index: int) -> dict:
-    """AI'a gönderilecek kısa özet. Header/çerez GÖNDERİLMEZ (oturum gizliliği)."""
+def _waf_header_names(entry: dict) -> list[str]:
+    """İstekteki x- başlıklarının SADECE adları (değerler — token/parmak izi — gönderilmez)."""
+    headers = entry.get("headers") or {}
+    return sorted({str(k).lower() for k in headers if str(k).lower().startswith("x-")})
+
+
+def _summarize(entry: dict, index: int, full_html: bool = False) -> dict:
+    """AI'a gönderilecek kısa özet. Header DEĞERLERİ/çerez GÖNDERİLMEZ (oturum gizliliği);
+    WAF tespiti için sadece x- başlıklarının adları ve isteğin yapıldığı page_url gönderilir.
+
+    HTML yanıtlar temizlenir (_clean_html); full_html=True ise MAX_HTML_CHARS'a kadar,
+    değilse MAX_BODY_CHARS'lık önizleme gönderilir.
+    """
     body = entry.get("body")
-    preview = json.dumps(body, ensure_ascii=False, default=str)
-    if len(preview) > MAX_BODY_CHARS:
-        preview = preview[:MAX_BODY_CHARS] + "...(kesildi)"
+    is_html = _is_html_entry(entry)
+    if is_html:
+        preview = _clean_html(body if isinstance(body, str) else str(body or ""))
+        if not full_html:
+            preview = _truncate(preview)
+    else:
+        preview = json.dumps(body, ensure_ascii=False, default=str)
+        if len(preview) > MAX_BODY_CHARS:
+            preview = preview[:MAX_BODY_CHARS] + "...(kesildi)"
     return {
         "index": index,
+        "format": "html" if is_html else "json",
         "url": entry.get("url"),
         "method": entry.get("method"),
         "status": entry.get("status"),
         "content_type": entry.get("content_type", ""),
         "post_data": _truncate(entry.get("post_data")),
+        "page_url": entry.get("page_url"),
+        "waf_headers": _waf_header_names(entry),
         "body_preview": preview,
     }
+
+
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# AI'ın {uuid} yerine yazabileceği varyantlar → {uuid}
+_UUID_PLACEHOLDER_RE = re.compile(r"\{\s*(?:uuid(?:\.uuid4\(\))?|uuid4(?:\(\))?|UUID|cId|cid)\s*\}")
+
+
+def _base_host(url: str) -> str:
+    """Kayıt alanı (örn. www.turkishairlines.com, api.x.com.tr → x.com.tr) — aynı site kontrolü."""
+    host = (urlparse(url).hostname or "").lower()
+    labels = host.split(".")
+    n = 3 if len(labels) >= 3 and labels[-2] in ("com", "net", "org", "gov", "edu", "co") and len(labels[-1]) == 2 else 2
+    return ".".join(labels[-n:])
+
+
+def _normalize_waf_origin(template, request_url: str) -> str | None:
+    """waf_origin_template'i doğrular/normalize eder; geçersizse _SpecRetry fırlatır."""
+    if template in (None, "", "null"):
+        return None
+    if not isinstance(template, str):
+        raise _SpecRetry(f"waf_origin_template bir URL metni veya null olmalı: {template!r}")
+    tpl = _UUID_PLACEHOLDER_RE.sub("{uuid}", template.strip())
+    tpl = _UUID_RE.sub("{uuid}", tpl)  # AI gerçek UUID'yi kopyaladıysa yer tutucuya çevir
+    leftover = re.findall(r"\{[^}]*\}", tpl.replace("{uuid}", ""))
+    if leftover:
+        raise _SpecRetry(
+            f"waf_origin_template'te sadece {{uuid}} yer tutucusu olabilir, bulunan: {leftover}"
+        )
+    parts = urlparse(tpl.replace("{uuid}", "00000000-0000-4000-8000-000000000000"))
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise _SpecRetry(f"waf_origin_template geçerli bir http(s) URL'si değil: {template!r}")
+    if _base_host(tpl) != _base_host(request_url):
+        raise _SpecRetry(
+            f"waf_origin_template ({parts.hostname}) seçilen isteğin sitesiyle "
+            f"({urlparse(request_url).hostname}) aynı alan adında olmalı."
+        )
+    return tpl
+
+
+def _normalize_waf_headers(raw, entries: list[dict], api_url: str) -> list[str] | None:
+    """waf_headers_to_capture: küçük harfli, x- ile başlayan, API ile AYNI host'a giden isteklerde
+    GERÇEKTEN görülmüş ve kopyalanması güvenli (healer._is_capturable) adlar."""
+    from core.healer import _is_capturable
+
+    if raw in (None, "", []):
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise _SpecRetry(f"waf_headers_to_capture bir başlık adı listesi veya null olmalı: {raw!r}")
+    api_host = (urlparse(api_url).hostname or "").lower()
+    seen = {
+        h for e in entries
+        if (urlparse(e.get("url") or "").hostname or "").lower() == api_host
+        for h in _waf_header_names(e)
+        if _is_capturable(h)
+    }
+    names, unknown = [], []
+    for h in raw:
+        name = str(h or "").strip().lower()
+        if not name:
+            continue
+        if name in seen:
+            if name not in names:
+                names.append(name)
+        else:
+            unknown.append(name)
+    if unknown and not names:
+        raise _SpecRetry(
+            f"waf_headers_to_capture içindeki başlıklar API host'una ({api_host}) giden isteklerde yok "
+            f"veya kopyalanamaz: {unknown}. Sadece şunlardan seç: {sorted(seen) or '(hiç x- başlığı yok)'}"
+        )
+    if unknown:
+        print(f"   ⚠️ API host'unda görülmeyen/kopyalanamaz başlıklar atlandı: {', '.join(unknown)}")
+    return names or None
+
+
+def _url_origin(url: str) -> str | None:
+    parts = urlparse(url or "")
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        return None
+    return f"{parts.scheme}://{parts.netloc}/"
+
+
+def _resolve_origin_url(ai_value, entries: list[dict], spec: dict) -> str | None:
+    """Healer'ın başlayacağı origin. None = healer._site_origin (sitenin www ana sayfası).
+
+    Öncelik: isteğin GERÇEKTEN yapıldığı sayfanın (page_url) origin'i — tarayıcı isteğe o
+    sayfadan izin verdiği için CORS orada kesin çalışır (Pegasus: web.flypgs.com/booking →
+    https://web.flypgs.com/; Trendyol: www.trendyol.com → apigw'ye rağmen None).
+    page_url yoksa AI'ın origin_url'i doğrulanarak kullanılır.
+    """
+    from core.healer import _site_origin
+
+    default = _site_origin(spec["url"])
+    entry = _find_entry(entries, spec)
+    page_origin = _url_origin(entry.get("page_url")) if entry else None
+    if page_origin and _base_host(page_origin) == _base_host(spec["url"]):
+        chosen = page_origin
+        ai_origin = _url_origin(ai_value) if isinstance(ai_value, str) else None
+        if (ai_origin or default) != chosen:
+            print(f"   ℹ️  origin_url isteğin yapıldığı sayfadan alındı: {chosen} (AI: {ai_value!r})")
+    elif ai_value in (None, "", "null"):
+        return None
+    else:
+        chosen = _url_origin(ai_value) if isinstance(ai_value, str) else None
+        if not chosen:
+            raise _SpecRetry(f"origin_url geçerli bir http(s) URL'si veya null olmalı: {ai_value!r}")
+        if _base_host(chosen) != _base_host(spec["url"]):
+            raise _SpecRetry(
+                f"origin_url ({chosen}) API ile ({urlparse(spec['url']).hostname}) aynı alan adında olmalı."
+            )
+    return None if chosen == default else chosen
+
+
+def _validate_json_fields(entries: list[dict], spec: dict, last_attempt: bool = False) -> None:
+    """items_path ve fields yollarını yakalanan TAM JSON yanıt üzerinde dener."""
+    entry = _find_entry(entries, spec)
+    body = entry.get("body") if entry else None
+    if not isinstance(body, (dict, list)):
+        return  # yanıt yakalanmamış / JSON değil — doğrulanamaz
+    items_path = str(spec["items_path"])
+    items = _get_value(body, items_path) if _path_exists(body, items_path) else None
+    if not isinstance(items, list) or not items:
+        top = list(body)[:30] if isinstance(body, dict) else f"liste ({len(body)} öğe)"
+        raise _SpecRetry(
+            f"items_path {items_path!r} yakalanan yanıtta boş olmayan bir liste değil. "
+            f"Yanıtın üst düzey anahtarları: {top}"
+        )
+    sample = [it for it in items[:20] if isinstance(it, (dict, list))]
+    if not sample:
+        return  # öğeler düz değer (string/sayı) — alt yol doğrulaması anlamsız
+    missing = {
+        key: path for key, path in spec["fields"].items()
+        if not path or not any(_path_exists(it, str(path)) for it in sample)
+    }
+    if not missing:
+        return
+    if last_attempt and len(missing) < len(spec["fields"]):
+        print(f"   ⚠️ Öğelerde bulunamayan alanlar çıkarıldı: {missing}")
+        spec["fields"] = {k: v for k, v in spec["fields"].items() if k not in missing}
+        return
+    preview = json.dumps(sample[0], ensure_ascii=False, default=str)
+    raise _SpecRetry(
+        f"fields içindeki şu yollar '{items_path}' öğelerinde bulunamadı: {missing}. "
+        f"Yollar tek bir öğeye göre olmalı. İlk öğenin yapısı: {_truncate(preview, 3000)}"
+    )
 
 
 def _strip_json_fence(text: str) -> str:
@@ -197,6 +552,21 @@ def _guess_query_param(url: str) -> str:
     return "q"
 
 
+# Üretilen client.py'deki Healer kurulumu (CLIENT_TEMPLATE'e {healer_factory} olarak girer;
+# .format() ile işlenmez, süslü parantezler olduğu gibi kalır).
+PLAIN_HEALER_FACTORY = '''def _new_healer(session) -> Healer:
+    # ORIGIN_URL None ise Healer sitenin ana sayfasından (www) başlar.
+    return Healer(session, origin=ORIGIN_URL, capture_headers=WAF_HEADERS_TO_CAPTURE)'''
+
+WAF_HEALER_FACTORY = '''def _new_healer(session) -> Healer:
+    """WAF: her çağrıda yeni cId/token ile, yakalanan sayfa üzerinden başlar."""
+    return Healer(
+        session,
+        origin=WAF_ORIGIN_TEMPLATE.replace("{uuid}", str(uuid.uuid4())),
+        capture_headers=WAF_HEADERS_TO_CAPTURE,
+    )'''
+
+
 CLIENT_TEMPLATE = '''"""{site_name} istemcisi — core.compiler tarafından otomatik üretildi.
 
 Amaç: {intent}
@@ -204,15 +574,17 @@ Amaç: {intent}
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
+import json
 import sys
-from pathlib import Path
-from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urlparse, urlunparse
+{uuid_import}from pathlib import Path
+from urllib.parse import parse_qsl, quote, quote_plus, urlencode, urljoin, urlparse, urlunparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from core.healer import Healer  # noqa: E402
+from core.healer import CAPTCHA_MARKERS, Healer, _with_params  # noqa: E402
 from core.session import SessionManager  # noqa: E402
 
 SITE_NAME = {site_name!r}
@@ -231,8 +603,28 @@ BODY_TEMPLATE = {body_template!r}
 # search(**kwargs) parametreleri: {{ad: BODY_TEMPLATE içindeki yol}}.
 # GET'te {{"query": None}} — arama kelimesi URL'ye (QUERY_PARAM / QUERY_TEMPLATES) gider.
 PARAMETERS = {parameters!r}
+# "json": API yanıtı | "html": SSR sayfa (BeautifulSoup ile ayrıştırılır).
+PARSER_TYPE = {parser_type!r}
 ITEMS_PATH = {items_path!r}
+# html: gömülü JSON script'inin selector'ı (örn. script#__NEXT_DATA__) — varsa ITEMS_PATH/FIELDS JSON yoludur.
+EMBEDDED_JSON = {embedded_json!r}
+# html + gömülü JSON yok: her öğeyi seçen CSS selector; FIELDS alt selector'dır ("a.title@href" = öznitelik).
+ITEMS_SELECTOR = {items_selector!r}
 FIELDS = {fields!r}
+HTML_MAX_ATTEMPTS = 3  # captcha/doğrulama sayfasında kullanıcıya tanınan deneme sayısı
+# WAF (Akamai/PerimeterX): Healer, sitenin JS'inin ürettiği x- başlıklarını (x-bfp vb.) yakalar.
+WAF_DETECTED = {waf_detected!r}
+# Healer'ın açacağı sayfa; {{uuid}} her çağrıda yeni bir uuid4 ile değiştirilir (None = site ana sayfası).
+WAF_ORIGIN_TEMPLATE = {waf_origin_template!r}
+# Healer'ın sayfanın kendi isteklerinden yakalayıp bizim isteğe ekleyeceği başlıklar
+# (None = varsayılan x-bfp modu).
+WAF_HEADERS_TO_CAPTURE = {waf_headers_to_capture!r}
+# API ana siteden (www) farklı bir alt alan adındaki sayfadan çağrılıyorsa (örn. web.flypgs.com)
+# Healer o origin'den başlar; aksi halde CORS "Failed to fetch" verir. None = site ana sayfası.
+ORIGIN_URL = {origin_url!r}
+
+
+{healer_factory}
 
 
 def _get_path(data, path: str):
@@ -319,6 +711,82 @@ def _query_params(query: str) -> dict:
     return params
 
 
+def _select_value(el, spec: str, page_url: str):
+    """'a.title' → metin, 'a.title@href' → öznitelik, '@href' → öğenin kendi özniteliği."""
+    sel, _, attr = (spec or "").partition("@")
+    sel, attr = sel.strip(), attr.strip()
+    target = el.select_one(sel) if sel else el
+    if target is None:
+        return None
+    if attr:
+        value = target.get(attr)
+        if isinstance(value, list):
+            value = " ".join(value)
+        if value and attr in ("href", "src", "data-src"):
+            value = urljoin(page_url, value)
+        return value
+    return target.get_text(" ", strip=True) or None
+
+
+def _parse_html(html: str, page_url: str) -> list[dict] | None:
+    """HTML'den sonuçları çıkarır; ayrıştırılacak yapı bulunamazsa None döner."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    if EMBEDDED_JSON:
+        for tag in soup.select(EMBEDDED_JSON):
+            try:
+                data = json.loads(tag.string or tag.get_text() or "")
+            except (TypeError, ValueError):
+                continue
+            items = _get_path(data, ITEMS_PATH)
+            if isinstance(items, list):
+                return [{{key: _get_path(item, path) for key, path in FIELDS.items()}} for item in items]
+        return None
+    elements = soup.select(ITEMS_SELECTOR)
+    if not elements:
+        return None
+    return [{{key: _select_value(el, sel, page_url) for key, sel in FIELDS.items()}} for el in elements]
+
+
+def _looks_blocked(status: int, html: str) -> bool:
+    low = html[:20000].lower()
+    return status in (403, 429) or any(m in low for m in CAPTCHA_MARKERS)
+
+
+async def _fetch_html_results(healer: Healer, url: str) -> list[dict]:
+    """Sayfayı kullanıcının Chrome profilinde açar (gerçek oturum/çerez), HTML'i ayrıştırır.
+
+    Captcha kontrolü sadece sonuç bulunamadığında yapılır: normal SSR sayfalarında da
+    "captcha" kelimesi (örn. recaptcha script'i) geçebildiği için.
+    """
+    bridge = healer.bridge
+    await bridge.start()
+    page = await bridge._context.new_page()
+    try:
+        for attempt in range(1, HTML_MAX_ATTEMPTS + 1):
+            response = await page.goto(url, wait_until="domcontentloaded")
+            status = response.status if response else 200
+            html = await page.content()
+            results = _parse_html(html, page.url)
+            if results is not None:
+                return results
+            if not _looks_blocked(status, html):
+                if status >= 400:
+                    raise RuntimeError(f"HTTP {{status}}: {{url}}")
+                return []  # sayfa normal ama sonuç yok
+            if attempt == HTML_MAX_ATTEMPTS:
+                raise RuntimeError(f"Doğrulama {{HTML_MAX_ATTEMPTS}} denemede geçilemedi (HTTP {{status}}).")
+            print(
+                "🔔 Doğrulama gerekiyor (captcha / robot kontrolü). "
+                "Lütfen açılan Chrome sekmesinde tamamlayın, sonra ENTER'a basın."
+            )
+            await asyncio.to_thread(input)
+        return []
+    finally:
+        await page.close()
+
+
 async def search(**kwargs) -> list[dict]:
     """Parametreler: PARAMETERS anahtarları (örn. search(origin="IST", destination="AYT", date="2026-12-01"))."""
     missing = [p for p in PARAMETERS if kwargs.get(p) in (None, "")]
@@ -331,12 +799,18 @@ async def search(**kwargs) -> list[dict]:
         )
     query = kwargs.get("query")
     session = SessionManager(SITE_NAME)
-    healer = Healer(session)
+    healer = _new_healer(session)
+    params = _query_params(str(query)) if query is not None else {{}}
+    if PARSER_TYPE == "html":
+        try:
+            return await _fetch_html_results(healer, _with_params(_base_url(), params))
+        finally:
+            await healer.close()
     try:
         data = await healer.fetch(
             _base_url(),
             method=METHOD,
-            params=_query_params(str(query)) if query is not None else {{}},
+            params=params,
             json=_build_payload(kwargs),
         )
     finally:
@@ -355,9 +829,6 @@ search.__signature__ = inspect.Signature(
 
 
 if __name__ == "__main__":
-    import asyncio
-    import json
-
     # python client.py origin=IST destination=AYT   |   python client.py "saat" (tek query)
     args = sys.argv[1:]
     if len(args) == 1 and "=" not in args[0] and list(PARAMETERS) == ["query"]:
@@ -377,37 +848,132 @@ class Compiler:
         self.model = model
         self.client = AsyncOpenAI(api_key=api_key)
 
+    @staticmethod
+    def _validate_html_spec(entries: list[dict], spec: dict) -> None:
+        """AI'ın selector/yollarını yakalanan TAM HTML üzerinde dener (AI kesik kopyayı gördü)."""
+        from bs4 import BeautifulSoup
+
+        entry = _find_entry(entries, spec)
+        if entry is None or not _is_html_entry(entry):
+            raise ValueError(f"AI'ın seçtiği HTML isteği yakalanan trafikte bulunamadı: {spec['url']}")
+        spec["url"] = entry["url"]
+        html = entry.get("body") if isinstance(entry.get("body"), str) else ""
+
+        if spec["embedded_json"]:
+            data = _extract_embedded_json(html, spec["embedded_json"], spec["items_path"])
+            items = _get_value(data, spec["items_path"]) if data is not None else None
+            if not isinstance(items, list) or not items:
+                raise _SpecRetry(
+                    f"Gömülü JSON '{spec['embedded_json']}' içinde '{spec['items_path']}' yolunda "
+                    "ilan/ürün listesi bulunamadı. items_selector boş olamaz, lütfen HTML elementlerini "
+                    "seç (embedded_json ve items_path null olsun)."
+                )
+            print(f"   🧩 Gömülü JSON: {len(items)} öğe bulundu ({spec['embedded_json']}).")
+            return
+
+        soup = BeautifulSoup(html, "html.parser")
+        try:
+            elements = soup.select(spec["items_selector"])
+        except Exception as e:
+            raise _SpecRetry(f"Geçersiz CSS selector: {spec['items_selector']!r} ({e}).") from e
+        if not elements:
+            raise _SpecRetry(
+                f"items_selector {spec['items_selector']!r} sayfada hiçbir öğe seçmedi. "
+                "Lütfen ilanları/ürünleri gerçekten seçen bir CSS selector bul."
+            )
+        empty = []
+        for key, sel in spec["fields"].items():
+            css = str(sel or "").partition("@")[0].strip()
+            try:
+                if css and not any(el.select_one(css) for el in elements):
+                    empty.append(key)
+            except Exception as e:
+                raise _SpecRetry(f"'{key}' için geçersiz CSS selector: {sel!r} ({e}).") from e
+        print(f"   🧩 HTML: {len(elements)} öğe bulundu ({spec['items_selector']}).")
+        if empty:
+            print(f"   ⚠️ Şu alanlar hiçbir öğede bulunamadı: {', '.join(empty)}")
+
     async def _ask_ai(self, intent: str, entries: list[dict]) -> dict:
-        summaries = [_summarize(e, i) for i, e in enumerate(entries)]
+        html_idx = [i for i, e in enumerate(entries) if _is_html_entry(e)]
+        html_full = set(html_idx[:MAX_HTML_FULL])  # sadece en öncelikli HTML'ler tam gider
+        summaries = [_summarize(e, i, full_html=i in html_full) for i, e in enumerate(entries)]
         prompt = PROMPT_TEMPLATE.format(
             intent=intent,
             requests=json.dumps(summaries, ensure_ascii=False, indent=1),
         )
-        resp = await self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-        )
-        content = resp.choices[0].message.content or ""
-        try:
-            spec = json.loads(_strip_json_fence(content))
-        except json.JSONDecodeError as e:
-            raise ValueError(f"AI geçerli JSON döndürmedi: {content[:500]}") from e
-
-        if spec.get("error"):
-            raise ValueError(
-                f"AI uygun bir JSON API bulamadı: {spec['error']} "
-                "(site arama sonuçlarını HTML olarak dönüyor olabilir)."
+        messages = [{"role": "user", "content": prompt}]
+        for attempt in range(1, MAX_AI_ATTEMPTS + 1):
+            resp = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                response_format={"type": "json_object"},
             )
+            content = resp.choices[0].message.content or ""
+            try:
+                spec = json.loads(_strip_json_fence(content))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"AI geçerli JSON döndürmedi: {content[:500]}") from e
+            try:
+                return self._finalize_spec(entries, spec, last_attempt=attempt == MAX_AI_ATTEMPTS)
+            except _SpecRetry as e:
+                if attempt == MAX_AI_ATTEMPTS:
+                    raise ValueError(f"AI {MAX_AI_ATTEMPTS} denemede geçerli bir cevap veremedi: {e}") from e
+                print(f"   🔁 AI cevabı hatalı ({e}) — tekrar soruluyor ({attempt + 1}/{MAX_AI_ATTEMPTS})...")
+                messages += [
+                    {"role": "assistant", "content": content},
+                    {"role": "user", "content": f"HATA: {e}\nLütfen düzeltip aynı JSON formatında tekrar dön."},
+                ]
+        raise RuntimeError("unreachable")
 
-        missing = [k for k in ("url", "items_path", "fields") if not spec.get(k)]
+    def _finalize_spec(self, entries: list[dict], spec: dict, last_attempt: bool = False) -> dict:
+        """AI cevabını doğrular/normalize eder. Düzeltilebilir hatalarda _SpecRetry fırlatır.
+
+        last_attempt=True ise (son deneme) bazı alanları bulunamayan fields hata yerine
+        uyarıyla ayıklanır; hiçbiri bulunamazsa yine hata verilir.
+        """
+        if spec.get("error"):
+            raise ValueError(f"AI arama sonuçlarını dönen bir istek bulamadı: {spec['error']}")
+
+        parser_type = str(spec.get("parser_type") or "json").strip().lower()
+        if parser_type not in ("json", "html"):
+            raise ValueError(f"Geçersiz parser_type: {parser_type!r}")
+        spec["parser_type"] = parser_type
+        spec["embedded_json"] = (spec.get("embedded_json") or None) if parser_type == "html" else None
+        spec["items_selector"] = (spec.get("items_selector") or None) if parser_type == "html" else None
+        if parser_type == "html" and spec["embedded_json"] and "ld+json" in str(spec["embedded_json"]).lower():
+            raise _SpecRetry(
+                "application/ld+json SEO verisidir, arama sonuçları listesi değildir. "
+                "items_selector boş olamaz, lütfen HTML elementlerini seç (embedded_json ve items_path null olsun)."
+            )
+        if spec["embedded_json"]:
+            spec["items_selector"] = None  # __NEXT_DATA__ / application/json varsa CSS'e gerek yok
+
+        if parser_type == "html" and not spec["embedded_json"] and not spec["items_selector"]:
+            # AI items_selector yerine items_path döndürdü (örn. JSON-LD'ye aldandı).
+            raise _SpecRetry("items_selector boş olamaz, lütfen HTML elementlerini seç.")
+
+        required = ["url"]  # fields aşağıda ayrıca (daha açıklayıcı mesajla) kontrol edilir
+        if parser_type == "json" or spec["embedded_json"]:
+            required.append("items_path")
+        missing = [k for k in required if not spec.get(k)]
         if missing:
-            raise ValueError(f"AI cevabında eksik alan(lar): {missing} — {spec}")
-        if not isinstance(spec["fields"], dict):
-            raise ValueError(f"'fields' bir obje olmalı: {spec['fields']!r}")
+            raise _SpecRetry(f"Cevapta eksik alan(lar): {missing}. Lütfen bu alanları doldur.")
+        if not isinstance(spec["fields"], dict) or not spec["fields"]:
+            raise _SpecRetry(
+                f"'fields' boş olmayan bir obje olmalı: {spec['fields']!r}. items_path listesindeki "
+                "bir öğenin yapısını incele ve en az name ve price yollarını doldur."
+            )
+        if parser_type == "html" and not spec["embedded_json"]:
+            spec["items_path"] = None
 
         spec.setdefault("endpoint_name", "search")
         spec["method"] = (spec.get("method") or "GET").upper()
+        if parser_type == "html":
+            if spec["method"] != "GET":
+                raise ValueError("HTML (SSR) sayfalarında şu an sadece GET destekleniyor.")
+            self._validate_html_spec(entries, spec)
+        else:
+            _validate_json_fields(entries, spec, last_attempt)
 
         # POST: gövde şablonu + kullanıcı parametreleri ({ad: yol}); GET: tek "query".
         ai_body = spec.get("body_template")
@@ -476,6 +1042,30 @@ class Compiler:
         spec["query_param"] = qp
         spec["query_templates"] = templates
         spec["drop_params"] = sorted(drop_set)
+
+        # WAF: waf_detected bool olmalı; True ise waf_origin_template geçerli (aynı siteden) URL olmalı.
+        waf = spec.get("waf_detected")
+        if isinstance(waf, str):
+            waf = waf.strip().lower() in ("true", "1", "yes", "evet")
+        elif waf is None:
+            waf = False
+        elif not isinstance(waf, bool):
+            raise _SpecRetry(f"waf_detected boolean (true/false) olmalı: {waf!r}")
+        spec["waf_detected"] = waf
+        spec["waf_origin_template"] = (
+            _normalize_waf_origin(spec.get("waf_origin_template"), spec["url"]) if waf else None
+        )
+        spec["waf_headers_to_capture"] = (
+            _normalize_waf_headers(spec.get("waf_headers_to_capture"), entries, spec["url"]) if waf else None
+        )
+        spec["origin_url"] = (
+            None if parser_type == "html" else _resolve_origin_url(spec.get("origin_url"), entries, spec)
+        )
+        if spec["origin_url"]:
+            print(f"   🌐 Origin (CORS): {spec['origin_url']}")
+        if waf:
+            print(f"   🛡️  WAF tespit edildi; origin: {spec['waf_origin_template'] or spec['origin_url'] or '(site ana sayfası)'}")
+            print(f"   🔑 Yakalanacak başlıklar: {', '.join(spec['waf_headers_to_capture'] or ['(varsayılan: x-bfp)'])}")
         return spec
 
     async def compile(
@@ -491,13 +1081,15 @@ class Compiler:
 
         useful = filter_useful(traffic)[:MAX_ENTRIES]
         if not useful:
-            raise ValueError("Filtreden sonra işe yarar JSON isteği kalmadı.")
+            raise ValueError("Filtreden sonra işe yarar JSON/HTML isteği kalmadı.")
 
         spec = await self._ask_ai(intent, useful)
 
         out_dir = REGISTRY_DIR / site_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # WAF + origin şablonu varsa uuid'li origin; aksi halde (WAF olsa da) normal Healer.
+        use_waf_origin = bool(spec["waf_detected"] and spec["waf_origin_template"])
         client_code = CLIENT_TEMPLATE.format(
             site_name=site_name,
             intent=intent,
@@ -509,8 +1101,19 @@ class Compiler:
             query_templates=spec["query_templates"],
             body_template=spec["body_template"],
             parameters=spec["parameters"],
+            parser_type=spec["parser_type"],
             items_path=spec["items_path"],
+            embedded_json=spec["embedded_json"],
+            items_selector=spec["items_selector"],
             fields=spec["fields"],
+            waf_detected=spec["waf_detected"],
+            waf_origin_template=spec["waf_origin_template"],
+            waf_headers_to_capture=(
+                tuple(spec["waf_headers_to_capture"]) if spec["waf_headers_to_capture"] else None
+            ),
+            origin_url=spec["origin_url"],
+            uuid_import="import uuid\n" if use_waf_origin else "",
+            healer_factory=WAF_HEALER_FACTORY if use_waf_origin else PLAIN_HEALER_FACTORY,
         )
         (out_dir / "client.py").write_text(client_code, encoding="utf-8")
 
@@ -526,8 +1129,15 @@ class Compiler:
                 "drop_params": spec["drop_params"],
                 "query_templates": spec["query_templates"],
                 "parameters": spec["parameters"],
+                "parser_type": spec["parser_type"],
                 "items_path": spec["items_path"],
+                "embedded_json": spec["embedded_json"],
+                "items_selector": spec["items_selector"],
                 "fields": spec["fields"],
+                "waf_detected": spec["waf_detected"],
+                "waf_origin_template": spec["waf_origin_template"],
+                "waf_headers_to_capture": spec["waf_headers_to_capture"],
+                "origin_url": spec["origin_url"],
             },
         }
         (out_dir / "schema.json").write_text(

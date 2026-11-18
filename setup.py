@@ -17,6 +17,8 @@ setup(
         "pydantic",
         "mcp",
         "cryptography",
+        "beautifulsoup4",
+        "lxml",
     ],
     entry_points={
         'console_scripts': [

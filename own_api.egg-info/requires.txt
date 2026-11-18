@@ -8,3 +8,5 @@ sqlalchemy
 pydantic
 mcp
 cryptography
+beautifulsoup4
+lxml

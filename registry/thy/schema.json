@@ -24,8 +24,7 @@
     "required": [
       "origin",
       "destination",
-      "departure_date",
-      "return_date"
+      "departure_date"
     ]
   },
   "endpoint": {

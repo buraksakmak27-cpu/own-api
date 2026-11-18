@@ -4,6 +4,7 @@
     own-api call trendyol -p query="saat" --limit 5
     own-api add trendyol https://www.trendyol.com --intent "ürün arama"
     own-api ask "trendyol'da 1000 TL altı duvar saati bul"
+    own-api heal                 (tüm siteler)   |   own-api heal trendyol thy
 """
 
 from __future__ import annotations
@@ -223,6 +224,37 @@ def ask(question: str) -> None:
         return final.choices[0].message.content or ""
 
     click.echo(asyncio.run(_ask()))
+
+
+@cli.command()
+@click.argument("sites", nargs=-1)
+def heal(sites: tuple[str, ...]) -> None:
+    """Kayıtlı siteleri test eder, bozulanları bildirir (Self-Healing).
+
+    Örn: own-api heal   |   own-api heal trendyol
+    """
+    from core.self_healing import broken_sites, heal_all
+
+    for site in sites:
+        if site not in _sites():
+            raise click.ClickException(
+                f"'{site}' bulunamadı. Kayıtlı siteler: {', '.join(_sites()) or '(yok)'}"
+            )
+    reports = asyncio.run(heal_all(list(sites) or None))
+    if not reports:
+        click.echo("Kayıtlı site yok. Eklemek için: own-api add <site> <url>")
+        return
+
+    broken = broken_sites(reports)
+    healthy = [s for s, r in reports.items() if r.ok]
+    click.echo(f"\n🩺 {len(healthy)}/{len(reports)} site sağlam.")
+    for site in broken:
+        click.echo(
+            f"⚠️ {site} bozulmuş! Otomatik onarım için 'own-api add {site} ...' komutunu "
+            "çalıştırın veya gece cron job'unu bekleyin."
+        )
+    if broken:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Yakalanan trafikten işe yarar JSON API çağrılarını ayıklar.
+"""Yakalanan trafikten işe yarar JSON API çağrılarını ve SSR HTML sayfalarını ayıklar.
 
 Sıralama önceliği:
   0. Arama sonucu olamayacak yanıtlar EN SONA: çeviri/CMS/ayar dosyaları (arayüz metinlerinde
@@ -6,7 +6,9 @@ Sıralama önceliği:
   1. Yanıt içeriğinde anahtar kelime geçenler (recorder'ın entry["keywords"] alanı;
      eski kayıtlarda alan yoksa gövde burada taranır) — örn. flight, fare, price.
   2. URL'de anahtar kelime geçenler (search, product, ...).
-  Eşitlikte orijinal sıra korunur; hiçbir JSON silinmez, sadece sıralanır.
+  Eşitlikte orijinal sıra korunur; hiçbir JSON/HTML silinmez, sadece sıralanır.
+  HTML yanıtlar (recorder 10.000 karakterden büyükleri kaydeder) SSR siteler
+  (Sahibinden, Hepsiburada) için AI'a gönderilecekler listesine dahildir.
 """
 
 from __future__ import annotations
@@ -71,6 +73,10 @@ def _is_json(entry: dict) -> bool:
     return "application/json" in ct or "+json" in ct
 
 
+def _is_html(entry: dict) -> bool:
+    return entry.get("format") == "html" or "text/html" in _content_type(entry)
+
+
 def _is_blocked(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
     return any(host == b or host.endswith("." + b) for b in BLOCKED_HOSTS)
@@ -112,9 +118,10 @@ def _score(entry: dict) -> tuple[int, int, int, int]:
 
 
 def filter_useful(traffic: list[dict]) -> list[dict]:
-    """Analitik/reklamı atar, sadece JSON'ları bırakır, anahtar kelimeye göre sıralar."""
+    """Analitik/reklamı atar, JSON ve HTML yanıtları bırakır, anahtar kelimeye göre sıralar."""
     kept = [
-        t for t in traffic if not _is_blocked(t.get("url", "")) and _is_json(t)
+        t for t in traffic
+        if not _is_blocked(t.get("url", "")) and (_is_json(t) or _is_html(t))
     ]
     # Stabil sıralama: eşit skorlarda orijinal sıra korunur.
     return sorted(kept, key=_score, reverse=True)

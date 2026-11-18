@@ -1,0 +1,56 @@
+{
+  "name": "pegasus_search",
+  "description": "pegasus üzerinde uçuş arama. Sonuç alanları: name, price",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "origin": {
+        "type": "string",
+        "description": "flightSearchList.0.departurePort (örnek format: SAW)"
+      },
+      "destination": {
+        "type": "string",
+        "description": "flightSearchList.0.arrivalPort (örnek format: ESB)"
+      },
+      "departure_date": {
+        "type": "string",
+        "description": "flightSearchList.0.departureDate (örnek format: 2026-11-23)"
+      },
+      "return_date": {
+        "type": "string",
+        "description": "flightSearchList.0.returnDate (örnek format: 2026-11-27)"
+      }
+    },
+    "required": [
+      "origin",
+      "destination",
+      "departure_date",
+      "return_date"
+    ]
+  },
+  "endpoint": {
+    "url": "https://web.flypgs.com/pegasus/availability",
+    "method": "POST",
+    "query_param": null,
+    "drop_params": [],
+    "query_templates": {},
+    "parameters": {
+      "origin": "flightSearchList.0.departurePort",
+      "destination": "flightSearchList.0.arrivalPort",
+      "departure_date": "flightSearchList.0.departureDate",
+      "return_date": "flightSearchList.0.returnDate"
+    },
+    "parser_type": "json",
+    "items_path": "departureRouteList.0.dailyFlightList",
+    "embedded_json": null,
+    "items_selector": null,
+    "fields": {
+      "name": "flightList.0.flightNo",
+      "price": "cheapestFare.amount"
+    },
+    "waf_detected": false,
+    "waf_origin_template": null,
+    "waf_headers_to_capture": null,
+    "origin_url": "https://web.flypgs.com/"
+  }
+}

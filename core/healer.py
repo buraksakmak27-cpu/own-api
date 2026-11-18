@@ -17,13 +17,35 @@ from core.chrome_bridge import ChromeBridge
 
 MAX_RETRIES = 3
 
-# Sayfanın kendi isteklerinden (x-bfp içerenlerden) yakalanıp bizim isteğe eklenecek başlıklar.
-# Beklenen başlıklar (bilgi/log için). Dinleyici, x-bfp taşıyan isteklerdeki
-# "x-" ile başlayan TÜM başlıkları yakalar; bu liste sınırlamaz.
+# Sayfanın kendi isteklerinden yakalanıp bizim isteğe eklenecek başlıklar.
+# Beklenen başlıklar (bilgi/log için). Dinleyici, hedef API host'una giden isteklerdeki
+# "x-" ile başlayan TÜM başlıkları yakalar (EXCLUDED_HEADERS hariç); bu liste sınırlamaz.
 CAPTURE_HEADERS = (
     "x-bfp", "x-clientid", "x-platform", "x-country", "x-requestid", "x-conversationid",
 )
 HEADER_WAIT_SECONDS = 15  # x-bfp için en fazla bu kadar beklenir
+# x-bfp olmayan sitelerde: başlık yakalandıktan sonra bu kadar süre yenisi gelmezse beklemeyi bitir.
+HEADER_SETTLE_SECONDS = 2.0
+
+# Asla kopyalanmayacak başlıklar: proxy/IP sahteciliği, istek yönlendirme ve tarayıcının
+# kendi (Google'a özel) iç başlıkları. Bunlar sunucuyu yanıltır veya CORS preflight'ı bozar.
+EXCLUDED_HEADERS = frozenset({
+    "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
+    "x-forwarded-server", "x-real-ip", "x-client-ip", "x-cluster-client-ip", "x-originating-ip",
+    "x-remote-ip", "x-remote-addr", "x-host", "x-original-url", "x-rewrite-url",
+    "x-original-host", "x-http-method-override", "x-http-method", "x-method-override",
+    "x-client-data",
+})
+EXCLUDED_HEADER_PREFIXES = ("x-forwarded-", "x-browser-", "x-sec-")
+
+
+def _is_capturable(name: str) -> bool:
+    name = name.lower()
+    return (
+        name.startswith("x-")
+        and name not in EXCLUDED_HEADERS
+        and not name.startswith(EXCLUDED_HEADER_PREFIXES)
+    )
 
 CAPTCHA_MARKERS = (
     "captcha",
@@ -34,6 +56,14 @@ CAPTCHA_MARKERS = (
     "are you a robot",
     "robot olmadığınızı",
     "access denied",
+    # OTP / 2FA — istek yanıtında bir doğrulama formu/metni dönerse:
+    "doğrulama kodu",
+    "dogrulama kodu",
+    "verification code",
+    "one-time",
+    "tek kullanımlık",
+    "sms kodu",
+    "2fa",
 )
 
 # Sayfa içinde çalışan fetch. credentials: 'include' → çerezler gönderilir.
@@ -111,11 +141,20 @@ class Healer:
         session: Any = None,
         bridge: Optional[ChromeBridge] = None,
         origin: Optional[str] = None,
+        capture_headers: Optional[tuple[str, ...]] = None,
     ) -> None:
         # session: core.session.SessionManager (client.py uyumluluğu için kabul edilir)
         self.session = session
         self.bridge = bridge or ChromeBridge()
         self.origin = origin
+        # Sitenin WAF başlıkları (örn. Pegasus: x-pgs-token, x-session-id). Verilmezse eski
+        # davranış: x-bfp taşıyan isteklerdeki tüm x- başlıkları (THY/Akamai).
+        self.capture_headers: Optional[tuple[str, ...]] = (
+            tuple(dict.fromkeys(h.strip().lower() for h in capture_headers if h and h.strip()))
+            or None
+            if capture_headers
+            else None
+        )
 
     async def _fetch_once(self, url: str, method: str, body: Optional[str] = None) -> Any:
         await self.bridge.start()
@@ -125,29 +164,58 @@ class Healer:
         # Sitenin kendi JS'inin, kullanıcının gerçek tarayıcısında ürettiği başlıklar.
         # Taklit edilmez; sayfanın kendi API isteklerinden okunur.
         captured_headers: dict[str, str] = {}
+        wanted = self.capture_headers  # None → hedef host'a giden tüm x- başlıkları
+        # Sadece hedef API ile AYNI host'a giden isteklerden yakalanır: sayfadaki üçüncü taraf
+        # istekler (Google reCAPTCHA: x-goog-api-key, x-browser-*; analitik vb.) API'ye
+        # taşınırsa CORS preflight reddeder ("Failed to fetch").
+        target_host = (urlparse(url).hostname or "").lower()
+        loop = asyncio.get_running_loop()
+        last_capture = [0.0]
 
         def _on_request(request) -> None:
             try:
                 headers = request.headers  # küçük harfli anahtarlar
+                req_host = (urlparse(request.url).hostname or "").lower()
             except Exception:
                 return
-            if "x-bfp" not in headers:
+            if req_host != target_host:
                 return
-            for name, value in headers.items():
-                if name.startswith("x-") and value:
-                    captured_headers[name] = value
+            names = wanted if wanted else [n for n in headers if _is_capturable(n)]
+            for name in names:
+                value = headers.get(name)
+                if value and _is_capturable(name):
+                    captured_headers[name] = value  # en güncel değer
+                    last_capture[0] = loop.time()
 
         page.on("request", _on_request)  # sayfa yüklenmeden ÖNCE
         try:
             origin = self.origin or _site_origin(url)
             await page.goto(origin, wait_until="domcontentloaded")
-            # Sayfanın JS'i başlıkları üretip x-bfp taşıyan bir API isteği atana kadar bekle.
-            loop = asyncio.get_running_loop()
+            # Sayfanın JS'i başlıkları üretip API'ye bir istek gönderene kadar bekle:
+            # - liste verildiyse: listedekilerin hepsi görülene kadar
+            # - verilmediyse: x-bfp görülene kadar (THY), ya da başlık yakalanıp
+            #   HEADER_SETTLE_SECONDS boyunca yenisi gelmeyene kadar (Pegasus: x-platform...).
+            required = wanted or ("x-bfp",)
             deadline = loop.time() + HEADER_WAIT_SECONDS
-            while "x-bfp" not in captured_headers and loop.time() < deadline:
+
+            def _done() -> bool:
+                if all(h in captured_headers for h in required):
+                    return True
+                return (
+                    not wanted
+                    and bool(captured_headers)
+                    and loop.time() - last_capture[0] >= HEADER_SETTLE_SECONDS
+                )
+
+            while not _done() and loop.time() < deadline:
                 await asyncio.sleep(0.2)
             print(f"   🔑 Yakalanan başlıklar: {', '.join(sorted(captured_headers)) or '(yok)'}")
-            if captured_headers:
+            not_found = [h for h in required if h not in captured_headers]
+            if wanted and not_found and captured_headers:
+                print(f"   ⚠️ {HEADER_WAIT_SECONDS} sn içinde görülmeyen başlıklar: {', '.join(not_found)}")
+            if not captured_headers:
+                print("   ⚠️ Header yakalanamadı, yine de deneniyor")
+            elif "x-bfp" in captured_headers:
                 # İstek takip kimlikleri (rastgele UUID) — sayfa üretmediyse biz üretiriz.
                 # Sadece bu başlık sistemini kullanan sitelerde (x-bfp yakalandıysa) eklenir;
                 # aksi halde örn. Trendyol'a gereksiz özel başlık gider ve CORS bozulabilir.
@@ -155,8 +223,6 @@ class Healer:
                     captured_headers["x-conversationid"] = str(uuid.uuid4())
                 if "x-requestid" not in captured_headers:
                     captured_headers["x-requestid"] = str(uuid.uuid4())
-            else:
-                print("   ⚠️ Header yakalanamadı, yine de deneniyor")
             # POST isteklerinde Referer: https://www.site.com/ (Origin tarayıcıdan otomatik gelir)
             referrer = origin if method == "POST" else None
             print(f"   🚀 Gönderilen Başlıklar: {captured_headers}")
@@ -186,9 +252,15 @@ class Healer:
         if status >= 400:
             raise RuntimeError(f"HTTP {status}: {text[:300]}")
         try:
-            return json.loads(text)
+            data = json.loads(text)
         except json.JSONDecodeError as e:
             raise RuntimeError(f"JSON olmayan yanıt ({content_type}): {text[:300]}") from e
+        # HTTP 200 ama uygulama düzeyinde başarısızlık (örn. THY: success=false).
+        # Böyle yanıtlar "0 sonuç" gibi görünmesin; hata mesajıyla yüzeye çıksın.
+        if isinstance(data, dict) and data.get("success") is False:
+            detail = data.get("statusDetailList") or data.get("message") or data.get("error")
+            raise RuntimeError(f"API başarısız (success=false): {_json.dumps(detail, ensure_ascii=False)[:300]}")
+        return data
 
     async def fetch_json(
         self,
@@ -211,7 +283,10 @@ class Healer:
                 # Kullanıcının çözebilmesi için sitenin sayfasını açık bırak.
                 page = await self.bridge.get_page()
                 await page.goto(self.origin or _site_origin(full_url), wait_until="domcontentloaded")
-                print(f"⚠️  {e} — Doğrulama gerekiyor, lütfen Chrome'da çözün. Bitince ENTER'a basın.")
+                print(
+                    f"🔔 {e} — Doğrulama gerekiyor (captcha / SMS / OTP / 2FA). "
+                    "Lütfen açılan Chrome penceresinde tamamlayın, sonra ENTER'a basın."
+                )
                 await asyncio.to_thread(input)
         raise RuntimeError("unreachable")
 

@@ -123,8 +123,12 @@ def _query_params(query: str) -> dict:
 
 
 async def search(**kwargs) -> list[dict]:
-    """Parametreler: PARAMETERS anahtarları (örn. search(origin="IST", destination="AYT", date="2026-12-01"))."""
-    missing = [p for p in PARAMETERS if kwargs.get(p) in (None, "")]
+    """Parametreler: PARAMETERS anahtarları (örn. search(origin="IST", destination="AYT", date="2026-12-01")).
+
+    return_date opsiyoneldir: boş/verilmemişse tek yön uçuş aranır.
+    """
+    optional = {"return_date"}  # tek yön uçuş için opsiyonel
+    missing = [p for p in PARAMETERS if p not in optional and kwargs.get(p) in (None, "")]
     unknown = [k for k in kwargs if k not in PARAMETERS]
     if missing or unknown:
         raise TypeError(
@@ -132,9 +136,30 @@ async def search(**kwargs) -> list[dict]:
             + (f" — eksik: {', '.join(missing)}" if missing else "")
             + (f" — bilinmeyen: {', '.join(unknown)}" if unknown else "")
         )
+    # Opsiyonel parametreler payload kurulumunda KeyError vermesin.
+    for _p in optional:
+        kwargs.setdefault(_p, "")
+
+    # Tarihleri THY'nin beklediği biçime (GG-AA-YYYY) çevir.
+    from core.compiler import normalize_date  # noqa: E402
+    if kwargs.get("departure_date"):
+        kwargs["departure_date"] = normalize_date(kwargs["departure_date"])
+    round_trip = bool(kwargs.get("return_date"))
+    if round_trip:
+        kwargs["return_date"] = normalize_date(kwargs["return_date"])
+
     query = kwargs.get("query")
     session = SessionManager(SITE_NAME)
     payload = _build_payload(kwargs)
+    # Tek yön: dönüş bacağını kaldır VE arama tipini "O" (tek yön) yap.
+    # THY'de selectedBookerSearch: "R"=gidiş-dönüş, "O"=tek yön. Sadece bacağı silmek
+    # yetmiyor; tip "R" kalırsa THY ikinci bacak bekler ve boş döner.
+    if not round_trip and isinstance(payload, dict):
+        legs = payload.get("originDestinationInformationList")
+        if isinstance(legs, list) and len(legs) > 1:
+            del legs[1]
+        if "selectedBookerSearch" in payload:
+            payload["selectedBookerSearch"] = "O"
     if isinstance(payload, dict) and "savedDate" in payload:
         # Her aramada şimdiki zaman (UTC, kayıttaki gibi milisaniyeli): 2026-11-17T09:48:08.309Z
         payload["savedDate"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -155,8 +180,16 @@ async def search(**kwargs) -> list[dict]:
 
 
 # search(**kwargs)'ın gerçek parametreleri dışarıya (CLI/MCP doğrulaması, inspect) görünsün.
+# OPTIONAL_PARAMS varsayılan "" alır → CLI/API bind'i tek yön uçuşta (return_date'siz) reddetmesin.
+OPTIONAL_PARAMS = {"return_date"}
 search.__signature__ = inspect.Signature(
-    [inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY) for name in PARAMETERS],
+    [
+        inspect.Parameter(
+            name, inspect.Parameter.KEYWORD_ONLY,
+            default="" if name in OPTIONAL_PARAMS else inspect.Parameter.empty,
+        )
+        for name in PARAMETERS
+    ],
     return_annotation="list[dict]",
 )
 

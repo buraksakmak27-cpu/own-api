@@ -1,0 +1,38 @@
+{
+  "name": "sahibinden_search",
+  "description": "sahibinden üzerinde ilan arama. Sonuç alanları: name, price, link",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Arama kelimesi"
+      }
+    },
+    "required": [
+      "query"
+    ]
+  },
+  "endpoint": {
+    "url": "https://www.sahibinden.com/cep-telefonu-aksesuar?query_textUnmodified=iphone&query_text=iphone&query_text_mf=iphone",
+    "method": "GET",
+    "query_param": "query_text",
+    "drop_params": [
+      "query_textUnmodified",
+      "query_text_mf"
+    ],
+    "query_templates": {},
+    "parameters": {
+      "query": null
+    },
+    "parser_type": "html",
+    "items_path": null,
+    "embedded_json": null,
+    "items_selector": ".searchResultsItem",
+    "fields": {
+      "name": ".classifiedTitle",
+      "price": ".searchResultsPriceValue",
+      "link": ".classifiedTitle@href"
+    }
+  }
+}
